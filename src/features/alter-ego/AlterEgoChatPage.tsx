@@ -1,19 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Card, CardContent, Page, PageBody, PageHeader, PageTitle, Textarea, toast } from '@blinkdotnew/ui'
 import { Loader2, RotateCcw, Sparkles } from 'lucide-react'
-import { blink } from '../../blink/client'
-import { useAuth } from '../../hooks/useAuth'
-import { buildOpeningMessage, toAiMessages } from './alterEgoPrompt'
 import type { ChatMessage } from './types'
 
 const DECISION_PLACEHOLDER = 'I chose engineering instead of pursuing music.'
+
+const EDGE_FUNCTION_URL = 'https://uthz92f0--alter-ego-chat.functions.blink.new'
 
 function createMessage(role: ChatMessage['role'], content: string): ChatMessage {
   return { id: crypto.randomUUID(), role, content }
 }
 
 export function AlterEgoChatPage() {
-  const { isAuthenticated, isLoading } = useAuth()
   const [decision, setDecision] = useState('')
   const [draft, setDraft] = useState('')
   const [started, setStarted] = useState(false)
@@ -33,17 +31,15 @@ export function AlterEgoChatPage() {
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isReplying])
 
-  const canStart = decision.trim().length > 0
-  const canSend = draft.trim().length > 0 && !isReplying && started && isAuthenticated
+  const canStart = decision.trim().length > 0 && !isReplying
+  const canSend = draft.trim().length > 0 && !isReplying && started
 
   const helperLabel = useMemo(() => {
-    if (isLoading) return 'Checking session…'
     if (!started) return 'Start the conversation when the untaken path feels right.'
-    if (!isAuthenticated) return 'Sign in to unlock AI replies from your alter ego.'
     return 'Ask about their work, love life, regrets, routines, or what they think of your current life.'
-  }, [isAuthenticated, isLoading, started])
+  }, [started])
 
-  const handleStart = () => {
+  const handleStart = async () => {
     const trimmedDecision = decision.trim()
     if (!trimmedDecision) {
       toast.error('Describe the path you did not take first.')
@@ -52,8 +48,31 @@ export function AlterEgoChatPage() {
 
     setStarted(true)
     setDecision(trimmedDecision)
-    setMessages([createMessage('assistant', buildOpeningMessage(trimmedDecision))])
     setDraft('')
+    setIsReplying(true)
+    setMessages([createMessage('assistant', '')])
+
+    try {
+      const response = await fetch(EDGE_FUNCTION_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: trimmedDecision, messages: [], streaming: false }),
+      })
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Server error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
+      }
+
+      const data = await response.json()
+      setMessages([createMessage('assistant', data.text || '...')])
+    } catch (err) {
+      setMessages([createMessage('assistant', "I'm here. Ask me anything about the life I lived.")])
+      const message = err instanceof Error ? err.message : 'Failed to start conversation.'
+      toast.error('Could not reach your alter ego', { description: message })
+    } finally {
+      setIsReplying(false)
+    }
   }
 
   const handleReset = () => {
@@ -68,11 +87,6 @@ export function AlterEgoChatPage() {
     const trimmedDraft = draft.trim()
     if (!trimmedDraft || isReplying || !started) return
 
-    if (!isAuthenticated) {
-      blink.auth.login(window.location.href)
-      return
-    }
-
     const userMessage = createMessage('user', trimmedDraft)
     const assistantMessage = createMessage('assistant', '')
     const nextMessages = [...messages, userMessage]
@@ -82,32 +96,41 @@ export function AlterEgoChatPage() {
     setMessages([...nextMessages, assistantMessage])
 
     try {
-      await blink.ai.streamText(
-        {
-          model: 'google/gemini-3-flash',
-          messages: toAiMessages(decision, nextMessages),
-          temperature: 0.9,
-          maxTokens: 260,
-        },
-        (chunk) => {
-          setMessages((current) =>
-            current.map((message) =>
-              message.id === assistantMessage.id
-                ? { ...message, content: message.content + chunk }
-                : message,
-            ),
-          )
-        },
-      )
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to reach your alter ego right now.'
-      const isAuthError = message.includes('401') || message.includes('Unauthorized')
+      const response = await fetch(EDGE_FUNCTION_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          decision,
+          messages: nextMessages.map(({ role, content }) => ({ role, content })),
+          streaming: true,
+        }),
+      })
 
-      if (isAuthError) {
-        blink.auth.login(window.location.href)
-        return
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: 'Server error' }))
+        throw new Error(error.error || `HTTP ${response.status}`)
       }
 
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = decoder.decode(value, { stream: true })
+        if (chunk.startsWith('[ERROR:')) {
+          throw new Error(chunk.replace('[ERROR:', '').replace(']', ''))
+        }
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistantMessage.id
+              ? { ...message, content: message.content + chunk }
+              : message,
+          ),
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to reach your alter ego right now.'
       setMessages((current) =>
         current.map((entry) =>
           entry.id === assistantMessage.id
@@ -162,9 +185,18 @@ export function AlterEgoChatPage() {
                     Reset &amp; Start New
                   </Button>
                 )}
-                <Button onClick={handleStart} disabled={!canStart} className="gap-2">
-                  <Sparkles className="h-4 w-4" />
-                  Start Chat
+                <Button onClick={() => void handleStart()} disabled={!canStart} className="gap-2">
+                  {isReplying ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Starting…
+                    </span>
+                  ) : (
+                    <>
+                      <Sparkles className="h-4 w-4" />
+                      Start Chat
+                    </>
+                  )}
                 </Button>
               </div>
             </div>
@@ -193,28 +225,8 @@ export function AlterEgoChatPage() {
                   </div>
                 ))}
 
-                {isLoading && !isAuthenticated && (
-                  <div className="flex justify-start">
-                    <div className="chat-bubble-alter-ego inline-flex items-center gap-2 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Restoring your session…
-                    </div>
-                  </div>
-                )}
-
                 <div ref={threadEndRef} />
               </div>
-
-              {!isAuthenticated && !isLoading && (
-                <div className="border-t border-border/70 bg-secondary/35 px-5 py-4 sm:px-6">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <p className="text-sm text-muted-foreground">
-                      Sign in to send messages and hear from this version of yourself.
-                    </p>
-                    <Button onClick={() => blink.auth.login(window.location.href)}>Continue to Sign In</Button>
-                  </div>
-                </div>
-              )}
 
               <div className="border-t border-border/70 px-5 py-4 sm:px-6">
                 <div className="flex flex-col gap-3 sm:flex-row">
@@ -223,7 +235,7 @@ export function AlterEgoChatPage() {
                     onChange={(event) => setDraft(event.target.value)}
                     placeholder="Ask what their life became..."
                     className="min-h-[92px] resize-none border-border/70 bg-background/80"
-                    disabled={!started || !isAuthenticated || isReplying}
+                    disabled={!started || isReplying}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' && !event.shiftKey) {
                         event.preventDefault()
